@@ -47,4 +47,16 @@ app.include_router(analytics.router)
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "online", "system": "SynapNotes Core", "version": "1.0.0"}
+    current = get_settings()
+    if (current.gemini_api_key or "").strip():
+        engine = "gemini"
+    elif (current.groq_api_key or "").strip():
+        engine = "groq"
+    else:
+        engine = "mock"
+    return {
+        "status": "online",
+        "system": "SynapNotes Core",
+        "version": "1.0.0",
+        "ai_engine": engine,
+    }

@@ -3,10 +3,26 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
+import httpx
+
 from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+# gemini-1.5-flash / 2.0-flash have been shut down; try current Flash IDs in order.
+GEMINI_MODEL_CANDIDATES = (
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+)
 
 SYSTEM_PROMPT = """You are SynapNotes AI, an expert meeting intelligence engine.
 Extract structured meeting intelligence from the transcript.
@@ -313,21 +329,75 @@ def mock_extract(transcript: str, meeting_title: str) -> dict[str, Any]:
     }
 
 
-def _call_gemini(transcript: str, meeting_title: str, api_key: str) -> dict[str, Any]:
-    import google.generativeai as genai
+def _gemini_models() -> list[str]:
+    preferred = (get_settings().gemini_model or "").strip()
+    models: list[str] = []
+    if preferred:
+        models.append(preferred)
+    for name in GEMINI_MODEL_CANDIDATES:
+        if name not in models:
+            models.append(name)
+    return models
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash")
+
+def _gemini_response_text(payload: dict[str, Any]) -> str:
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        feedback = payload.get("promptFeedback") or payload.get("error") or payload
+        raise ValueError(f"Gemini returned no candidates: {feedback}")
+    content = candidates[0].get("content") or {}
+    parts = content.get("parts") or []
+    text = "".join(str(part.get("text") or "") for part in parts)
+    if not text.strip():
+        raise ValueError(f"Gemini returned empty text: {candidates[0]}")
+    return text
+
+
+def _call_gemini_model(transcript: str, meeting_title: str, api_key: str, model: str) -> dict[str, Any]:
     prompt = (
-        f"{SYSTEM_PROMPT}\n\nMeeting title: {meeting_title}\n\n"
-        f"Transcript:\n{transcript[:24000]}"
+        f"Meeting title: {meeting_title}\n\nTranscript:\n{transcript[:24000]}"
     )
-    response = model.generate_content(prompt)
-    text = getattr(response, "text", None) or ""
-    if not text and getattr(response, "candidates", None):
-        parts = response.candidates[0].content.parts
-        text = "".join(getattr(part, "text", "") for part in parts)
-    return _extract_json(text)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body: dict[str, Any] = {
+        "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+    headers = {"x-goog-api-key": api_key, "content-type": "application/json"}
+    with httpx.Client(timeout=60.0) as client:
+        response = client.post(url, headers=headers, json=body)
+        if response.status_code >= 400:
+            # Older/limited models may reject JSON mime type or systemInstruction.
+            fallback_body = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": f"{SYSTEM_PROMPT}\n\n{prompt}"}],
+                    }
+                ]
+            }
+            response = client.post(url, headers=headers, json=fallback_body)
+        if response.status_code >= 400:
+            detail = response.text[:800]
+            raise RuntimeError(f"Gemini {model} HTTP {response.status_code}: {detail}")
+        payload = response.json()
+    return _extract_json(_gemini_response_text(payload))
+
+
+def _call_gemini(transcript: str, meeting_title: str, api_key: str) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for model in _gemini_models():
+        try:
+            result = _call_gemini_model(transcript, meeting_title, api_key, model)
+            logger.info("Gemini extraction succeeded with model %s", model)
+            return result
+        except Exception as exc:  # noqa: BLE001 - try the next published Flash alias
+            last_error = exc
+            logger.warning("Gemini model %s failed: %s", model, exc)
+    raise RuntimeError(f"All Gemini models failed: {last_error}") from last_error
 
 
 def _call_groq(transcript: str, meeting_title: str, api_key: str) -> dict[str, Any]:
@@ -357,12 +427,15 @@ def process_meeting_transcript(transcript: str, meeting_title: str) -> dict[str,
         try:
             return _call_gemini(transcript, meeting_title, gemini_key)
         except Exception:
-            pass
+            logger.exception("Gemini extraction failed; trying Groq/mock fallback")
+    else:
+        logger.warning("GEMINI_API_KEY is empty; skipping Gemini")
 
     if groq_key:
         try:
             return _call_groq(transcript, meeting_title, groq_key)
         except Exception:
-            pass
+            logger.exception("Groq extraction failed; using mock fallback")
 
+    logger.warning("Using deterministic mock AI extraction")
     return mock_extract(transcript, meeting_title)

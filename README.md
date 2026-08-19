@@ -51,7 +51,8 @@ On first boot the API seeds these users plus three meetings, including **Project
 | `DATABASE_URL` | backend | PostgreSQL URL. `postgres://` is rewritten to `postgresql://`. Empty or failing URLs fall back to `sqlite:///./synapnotes.db`. |
 | `SECRET_KEY` | backend | JWT signing secret |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | backend | Token lifetime (default 720) |
-| `GEMINI_API_KEY` | backend | Google Gemini (`gemini-1.5-flash`) |
+| `GEMINI_API_KEY` | backend | Google Gemini (`gemini-2.5-flash`, with fallbacks) |
+| `GEMINI_MODEL` | backend | Optional preferred Gemini model id |
 | `GROQ_API_KEY` | backend | Groq fallback (`llama-3.3-70b-versatile`) |
 | `VITE_API_URL` | frontend | API origin. Leave empty to use Vite/nginx proxy |
 
